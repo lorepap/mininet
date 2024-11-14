@@ -103,7 +103,7 @@ function version_ge {
 }
 
 # Auto-detect python venv
-if [ -n "$VIRTUAL_ENV" ]; then
+if [ -n "${VIRTUAL_ENV:-}" ]; then
     # We are in a virtual environment; use its Python interpreter
     PYTHON="${VIRTUAL_ENV}/bin/python"
     echo "Using virtual environment Python interpreter at $PYTHON"
