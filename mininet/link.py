@@ -404,6 +404,180 @@ class TCIntf( Intf ):
 
         return result
 
+class TCHighBwIntf( Intf ):
+    """Interface customized by tc (traffic control) utility for higher bandwidth (> 1 Gbps)
+       Allows specification of bandwidth limits (various methods)
+       as well as delay, loss and max queue length"""
+
+    bwParamMax = 100000
+
+    def bwCmds( self, bw=None, speedup=0, use_hfsc=False, use_tbf=False,
+                latency_ms=None, enable_ecn=False, enable_red=False ):
+        "Return tc commands to set bandwidth"
+
+        cmds, parent = [], ' root '
+
+        if bw and ( bw < 0 or bw > self.bwParamMax ):
+            error( 'Bandwidth limit', bw, 'is outside supported range 0..%d'
+                   % self.bwParamMax, '- ignoring\n' )
+        elif bw is not None:
+            # BL: this seems a bit brittle...
+            if ( speedup > 0 and
+                 self.node.name[0:1] == 's' ):
+                bw = speedup
+            # This may not be correct - we should look more closely
+            # at the semantics of burst (and cburst) to make sure we
+            # are specifying the correct sizes. For now I have used
+            # the same settings we had in the mininet-hifi code.
+            if use_hfsc:
+                cmds += [ '%s qdisc add dev %s root handle 5:0 hfsc default 1',
+                          '%s class add dev %s parent 5:0 classid 5:1 hfsc sc '
+                          + 'rate %fMbit ul rate %fMbit' % ( bw, bw ) ]
+            elif use_tbf:
+                if latency_ms is None:
+                    latency_ms = 15.0 * 8 / bw
+                cmds += [ '%s qdisc add dev %s root handle 5: tbf ' +
+                          'rate %fMbit burst 15000 latency %fms' %
+                          ( bw, latency_ms ) ]
+            else:
+                cmds += [ '%s qdisc add dev %s root handle 5:0 htb default 1',
+                          '%s class add dev %s parent 5:0 classid 5:1 htb ' +
+                          'rate %fMbit burst 15k' % bw ]
+            parent = ' parent 5:1 '
+
+            # ECN or RED
+            if enable_ecn:
+                cmds += [ '%s qdisc add dev %s' + parent +
+                          'handle 6: red limit 1000000 ' +
+                          'min 30000 max 35000 avpkt 1500 ' +
+                          'burst 20 ' +
+                          'bandwidth %fmbit probability 1 ecn' % bw ]
+                parent = ' parent 6: '
+            elif enable_red:
+                cmds += [ '%s qdisc add dev %s' + parent +
+                          'handle 6: red limit 1000000 ' +
+                          'min 30000 max 35000 avpkt 1500 ' +
+                          'burst 20 ' +
+                          'bandwidth %fmbit probability 1' % bw ]
+                parent = ' parent 6: '
+        return cmds, parent
+
+    @staticmethod
+    def delayCmds( parent, delay=None, jitter=None,
+                   loss=None, max_queue_size=None ):
+        "Internal method: return tc commands for delay and loss"
+        cmds = []
+        if loss and ( loss < 0 or loss > 100 ):
+            error( 'Bad loss percentage', loss, '%%\n' )
+        else:
+            # Delay/jitter/loss/max queue size
+            netemargs = '%s%s%s%s' % (
+                'delay %s ' % delay if delay is not None else '',
+                '%s ' % jitter if jitter is not None else '',
+                'loss %.5f ' % loss if (loss is not None and loss > 0) else '',
+                'limit %d' % max_queue_size if max_queue_size is not None
+                else '' )
+            if netemargs:
+                cmds = [ '%s qdisc add dev %s ' + parent +
+                         ' handle 10: netem ' +
+                         netemargs ]
+                parent = ' parent 10:1 '
+        return cmds, parent
+
+    def tc( self, cmd, tc='tc' ):
+        "Execute tc command for our interface"
+        c = cmd % (tc, self)  # Add in tc command and our name
+        debug(" *** executing command: %s\n" % c)
+        return self.cmd( c )
+
+    def config(  # pylint: disable=arguments-renamed,arguments-differ
+                self,
+                bw=None, delay=None, jitter=None, loss=None,
+                gro=False, txo=True, rxo=True,
+                speedup=0, use_hfsc=False, use_tbf=False,
+                latency_ms=None, enable_ecn=False, enable_red=False,
+                max_queue_size=None, **params ):
+        """Configure the port and set its properties.
+           bw: bandwidth in b/s (e.g. '10m')
+           delay: transmit delay (e.g. '1ms' )
+           jitter: jitter (e.g. '1ms')
+           loss: loss (e.g. '1%' )
+           gro: enable GRO (False)
+           txo: enable transmit checksum offload (True)
+           rxo: enable receive checksum offload (True)
+           speedup: experimental switch-side bw option
+           use_hfsc: use HFSC scheduling
+           use_tbf: use TBF scheduling
+           latency_ms: TBF latency parameter
+           enable_ecn: enable ECN (False)
+           enable_red: enable RED (False)
+           max_queue_size: queue limit parameter for netem"""
+
+        # Support old names for parameters
+        gro = not params.pop( 'disable_gro', not gro )
+
+        result = Intf.config( self, **params)
+
+        def on( isOn ):
+            "Helper method: bool -> 'on'/'off'"
+            return 'on' if isOn else 'off'
+
+        # Set offload parameters with ethool
+        self.cmd( 'ethtool -K', self,
+                  'gro', on( gro ),
+                  'tx', on( txo ),
+                  'rx', on( rxo ) )
+
+        # Optimization: return if nothing else to configure
+        # Question: what happens if we want to reset things?
+        if ( bw is None and not delay and not loss
+             and max_queue_size is None ):
+            return None
+
+        # Clear existing configuration
+        tcoutput = self.tc( '%s qdisc show dev %s' )
+        if "priomap" not in tcoutput and "noqueue" not in tcoutput:
+            cmds = [ '%s qdisc del dev %s root' ]
+        else:
+            cmds = []
+
+        # Bandwidth limits via various methods
+        bwcmds, parent = self.bwCmds( bw=bw, speedup=speedup,
+                                      use_hfsc=use_hfsc, use_tbf=use_tbf,
+                                      latency_ms=latency_ms,
+                                      enable_ecn=enable_ecn,
+                                      enable_red=enable_red )
+        cmds += bwcmds
+
+        # Delay/jitter/loss/max_queue_size using netem
+        delaycmds, parent = self.delayCmds( delay=delay, jitter=jitter,
+                                            loss=loss,
+                                            max_queue_size=max_queue_size,
+                                            parent=parent )
+        cmds += delaycmds
+
+        # Ugly but functional: display configuration info
+        stuff = ( ( [ '%.2fMbit' % bw ] if bw is not None else [] ) +
+                  ( [ '%s delay' % delay ] if delay is not None else [] ) +
+                  ( [ '%s jitter' % jitter ] if jitter is not None else [] ) +
+                  ( ['%.5f%% loss' % loss ] if loss is not None else [] ) +
+                  ( [ 'ECN' ] if enable_ecn else [ 'RED' ]
+                    if enable_red else [] ) )
+        info( '(' + ' '.join( stuff ) + ') ' )
+
+        # Execute all the commands in our node
+        debug("at map stage w/cmds: %s\n" % cmds)
+        tcoutputs = [ self.tc(cmd) for cmd in cmds ]
+        for output in tcoutputs:
+            if output != '':
+                error( "*** Error: %s" % output )
+        debug( "cmds:", cmds, '\n' )
+        debug( "outputs:", tcoutputs, '\n' )
+        result[ 'tcoutputs'] = tcoutputs
+        result[ 'parent' ] = parent
+
+        return result
+
 
 class Link( object ):
 
@@ -566,6 +740,13 @@ class TCLink( Link ):
         kwargs.setdefault( 'cls2', TCIntf )
         Link.__init__( self, *args, **kwargs)
 
+class TCHighBwLink( Link ):
+    "Link with TC interfaces for higher bandwidth (> 1 Gbps)"
+    def __init__( self, *args, **kwargs):
+        kwargs.setdefault( 'cls1', TCHighBwIntf )
+        kwargs.setdefault( 'cls2', TCHighBwIntf )
+        Link.__init__( self, *args, **kwargs)
+
 
 class TCULink( TCLink ):
     """TCLink with default settings optimized for UserSwitch
@@ -580,3 +761,17 @@ class TCULink( TCLink ):
     def __init__( self, *args, **kwargs ):
         kwargs.update( txo=False, rxo=False )
         TCLink.__init__( self, *args, **kwargs )
+
+class TCUHighBwLink( TCHighBwLink ):
+    """TCHighBwLink with default settings optimized for UserSwitch
+       (txo=rxo=0/False).  Unfortunately with recent Linux kernels,
+       enabling TX and RX checksum offload on veth pairs doesn't work
+       well with UserSwitch: either it gets terrible performance or
+       TCP packets with bad checksums are generated, forwarded, and
+       *dropped* due to having bad checksums! OVS and LinuxBridge seem
+       to cope with this somehow, but it is likely to be an issue with
+       many software Ethernet bridges."""
+
+    def __init__( self, *args, **kwargs ):
+        kwargs.update( txo=False, rxo=False )
+        TCHighBwLink.__init__( self, *args, **kwargs )
